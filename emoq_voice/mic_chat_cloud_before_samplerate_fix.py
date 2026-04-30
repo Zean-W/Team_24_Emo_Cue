@@ -1,0 +1,471 @@
+import os
+import gc
+import json
+import time
+import wave
+import warnings
+from collections import deque
+
+import numpy as np
+import sounddevice as sd
+import Jetson.GPIO as GPIO
+
+from faster_whisper import WhisperModel
+from openai import OpenAI
+from gtts import gTTS
+
+# Try to import the teammate's voice emotion module
+try:
+    from emotion_engine import EmotionEngine
+except ImportError:
+    EmotionEngine = None
+    print("⚠️ Warning: emotion_engine.py not found. Voice emotion disabled.", flush=True)
+
+warnings.filterwarnings("ignore")
+
+# =========================================================
+# Configuration
+# =========================================================
+
+# --- Cloud API Configuration ---
+API_KEY = "sk-c1ccce3719bb4dca9615613f743c17ef"
+BASE_URL = "https://api.deepseek.com"
+CLOUD_MODEL = "deepseek-chat"
+
+# --- Hardware / Path Configuration ---
+BUTTON_PIN = 40          # BOARD numbering
+INPUT_DEVICE = 0         # USB PnP Audio Device: Audio (hw:0,0)
+SAMPLE_RATE = 16000
+CHANNELS = 1
+MAX_RECORD_SECONDS = 10
+
+WHISPER_SIZE = "base"
+FUSION_JSON_PATH = os.path.expanduser("~/libreface_test/latest_fused.json")
+
+# --- State Machine / UX Settings ---
+TEST_MODE = True
+
+if TEST_MODE:
+    LOW_MOOD_WINDOW_SEC = 10
+    LOW_MOOD_RATIO = 0.6
+    PROMPT_COOLDOWN_SEC = 20
+    PROMPT_WAIT_TIMEOUT_SEC = 10
+    MONITOR_POLL_SEC = 0.1
+else:
+    LOW_MOOD_WINDOW_SEC = 120
+    LOW_MOOD_RATIO = 0.75
+    PROMPT_COOLDOWN_SEC = 3 * 60 * 60
+    PROMPT_WAIT_TIMEOUT_SEC = 20
+    MONITOR_POLL_SEC = 0.1
+
+NEGATIVE_EMOTIONS = {"sad", "fear", "angry", "disgust"}
+
+# =========================================================
+# Client init
+# =========================================================
+
+try:
+    client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+    print("☁️ Cloud Client (DeepSeek) connected successfully.", flush=True)
+except Exception as e:
+    print(f"❌ Cloud Client configuration failed: {e}", flush=True)
+    client = None
+
+# =========================================================
+# Helper functions
+# =========================================================
+
+def get_visual_context():
+    """Read fused visual context JSON from teammate's pipeline."""
+    if not os.path.exists(FUSION_JSON_PATH):
+        return {"who": "Unknown User", "emotion": "neutral", "conf": 0.0}
+
+    try:
+        with open(FUSION_JSON_PATH, "r") as f:
+            data = json.load(f)
+
+        who = data.get("who", "Unknown")
+        face_emotion = data.get("emotion", "neutral")
+        overall_conf = data.get("overall_conf", 0.0)
+
+        if overall_conf < 0.3 or who == "Unknown":
+            who = "Unknown User"
+
+        return {
+            "who": who,
+            "emotion": face_emotion.lower() if isinstance(face_emotion, str) else "neutral",
+            "conf": overall_conf
+        }
+    except Exception:
+        return {"who": "Unknown User", "emotion": "neutral", "conf": 0.0}
+
+
+def speak(text):
+    """Convert text to speech and play through speaker."""
+    if not text or len(text.strip()) == 0:
+        return
+
+    try:
+        print("🔊 EmoQ Speaking...", flush=True)
+        tts = gTTS(text=text, lang='en', slow=False)
+        audio_file = "response.mp3"
+        tts.save(audio_file)
+
+        # USB PnP Audio Device
+        os.system(f"mpg123 -a hw:0,0 -q {audio_file}")
+
+        if os.path.exists(audio_file):
+            os.remove(audio_file)
+    except Exception as e:
+        print(f"⚠️ TTS Audio Playback Error: {e}", flush=True)
+
+
+def ask_deepseek(text, final_emotion, identity, system_prompt):
+    """Send user input to DeepSeek cloud model."""
+    if client is None:
+        print("⚠️ Cloud client is not available.", flush=True)
+        return None
+
+    try:
+        final_message = f"[User Identity: {identity}] [User Emotion: {final_emotion}] User said: {text}"
+        response = client.chat.completions.create(
+            model=CLOUD_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": final_message},
+            ],
+            stream=True,
+            temperature=1.0,
+            max_tokens=200
+        )
+        return response
+    except Exception as e:
+        print(f"⚠️ Network Error: {e}", flush=True)
+        return None
+
+
+def button_pressed():
+    """Button is active-low."""
+    return GPIO.input(BUTTON_PIN) == 0
+
+
+def record_while_button_held(output_file="temp.wav", samplerate=SAMPLE_RATE):
+    """
+    Record audio while the button is held down.
+    Stops when button is released or max duration is reached.
+    """
+    print("🎤 Using input device index: 0 (USB PnP Audio Device)", flush=True)
+    print("🎙️ Recording... hold button while speaking.", flush=True)
+
+    frames = []
+    start_time = time.time()
+
+    def callback(indata, frames_count, time_info, status):
+        if status:
+            print(f"⚠️ Audio callback status: {status}", flush=True)
+        frames.append(indata.copy())
+
+    with sd.InputStream(
+        samplerate=samplerate,
+        channels=CHANNELS,
+        dtype='int16',
+        callback=callback,
+        device=INPUT_DEVICE
+    ):
+        while button_pressed():
+            if time.time() - start_time > MAX_RECORD_SECONDS:
+                print("⏱️ Max recording time reached.", flush=True)
+                break
+            time.sleep(0.01)
+
+    if not frames:
+        return None
+
+    audio_data = np.concatenate(frames, axis=0)
+    duration = len(audio_data) / samplerate
+    print(f"🕒 Recorded {duration:.2f} seconds", flush=True)
+
+    if duration < 0.8:
+        print("⚠️ Recording too short.", flush=True)
+        return None
+
+    with wave.open(output_file, "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(2)
+        wf.setframerate(samplerate)
+        wf.writeframes(audio_data.tobytes())
+
+    print(f"💾 Saved recording to {output_file}", flush=True)
+    return output_file
+
+
+def play_prompt():
+    prompt_text = "You seem a bit down. If you want to talk, press and hold the button."
+    print(f"💬 Prompt: {prompt_text}", flush=True)
+    speak(prompt_text)
+
+
+def is_negative_emotion(emotion):
+    return emotion in NEGATIVE_EMOTIONS
+
+
+def emotion_sample_valid(vis_context):
+    """
+    Only count samples when a user is present and confidence is decent enough.
+    """
+    who = vis_context["who"]
+    conf = vis_context["conf"]
+    return who != "Unknown User" and conf >= 0.5
+
+
+def should_trigger_prompt(emotion_history, last_prompt_time):
+    """
+    Decide whether to move from MONITORING to PROMPT.
+    """
+    now = time.time()
+
+    if now - last_prompt_time < PROMPT_COOLDOWN_SEC:
+        return False
+
+    if not emotion_history:
+        return False
+
+    total = len(emotion_history)
+    negative_count = sum(1 for _, emo in emotion_history if is_negative_emotion(emo))
+    ratio = negative_count / total if total > 0 else 0.0
+
+    print(f"📉 Mood trend check: {negative_count}/{total} negative = {ratio:.2f}", flush=True)
+
+    return ratio >= LOW_MOOD_RATIO
+
+
+# =========================================================
+# State handlers
+# =========================================================
+
+def monitoring_state(emotion_history, last_prompt_time):
+    """
+    Passive monitoring:
+    - user may press button anytime to start talking
+    - poll visual JSON
+    - keep emotion history window
+    - trigger prompt only if sustained negative mood and cooldown passed
+    """
+    print("🟢 State = MONITORING", flush=True)
+    print("👀 Monitoring face/emotion trend...", flush=True)
+    print("🖲️ User may also press button anytime to start talking.", flush=True)
+
+    while True:
+        # User-initiated conversation path
+        if button_pressed():
+            time.sleep(0.05)  # debounce
+            if button_pressed():
+                print("🖲️ Button pressed during MONITORING -> entering CONVERSATION", flush=True)
+                return "CONVERSATION"
+
+        vis_context = get_visual_context()
+        now = time.time()
+
+        # prune old samples
+        while emotion_history and (now - emotion_history[0][0] > LOW_MOOD_WINDOW_SEC):
+            emotion_history.popleft()
+
+        if emotion_sample_valid(vis_context):
+            emotion_history.append((now, vis_context["emotion"]))
+            print(
+                f"👤 Seen user: {vis_context['who']} | Face emotion: {vis_context['emotion']} "
+                f"| Conf: {vis_context['conf']:.2f}",
+                flush=True
+            )
+        else:
+            print(
+                f"👤 No reliable user context | who={vis_context['who']} "
+                f"| emotion={vis_context['emotion']} | conf={vis_context['conf']:.2f}",
+                flush=True
+            )
+
+        if should_trigger_prompt(emotion_history, last_prompt_time):
+            print("💡 Sustained low mood detected -> entering PROMPT", flush=True)
+            return "PROMPT"
+
+        time.sleep(MONITOR_POLL_SEC)
+
+
+def prompt_state():
+    """
+    Robot offers conversation and waits for button press.
+    If timeout, go back to monitoring.
+    """
+    print("🟡 State = PROMPT", flush=True)
+    play_prompt()
+
+    start_wait = time.time()
+    print("⌛ Waiting for user to press button...", flush=True)
+
+    while True:
+        if button_pressed():
+            time.sleep(0.05)
+            if button_pressed():
+                print("🖲️ Button pressed during PROMPT -> entering CONVERSATION", flush=True)
+                return "CONVERSATION"
+
+        if time.time() - start_wait > PROMPT_WAIT_TIMEOUT_SEC:
+            print("⌛ Prompt timed out. Returning to monitoring.", flush=True)
+            return "MONITORING"
+
+        time.sleep(0.01)
+
+
+def conversation_state(audio_model, emo_engine, system_prompt):
+    """
+    Button-driven voice interaction:
+    - button already pressed before entering
+    - record while held
+    - transcribe
+    - prioritize voice emotion
+    - respond
+    - return to monitoring
+    """
+    print("🔵 State = CONVERSATION", flush=True)
+
+    audio_path = record_while_button_held("temp.wav")
+    if not audio_path:
+        print("⚠️ No audio captured.", flush=True)
+        return "MONITORING"
+
+    print("🧠 Processing...", flush=True)
+
+    segments, info = audio_model.transcribe(audio_path, beam_size=5)
+    text = " ".join([segment.text for segment in segments]).strip()
+
+    print(f"📝 Transcription raw: {repr(text)}", flush=True)
+
+    if not text or len(text) < 2:
+        print("⚠️ No valid speech detected.", flush=True)
+        return "MONITORING"
+
+    voice_emotion = "neutral"
+    if emo_engine:
+        try:
+            voice_emotion = emo_engine.predict(audio_path)
+            if isinstance(voice_emotion, str):
+                voice_emotion = voice_emotion.lower()
+        except Exception as e:
+            print(f"⚠️ Voice emotion error: {e}", flush=True)
+            voice_emotion = "neutral"
+
+    vis_context = get_visual_context()
+    face_emotion = vis_context["emotion"]
+    identity = vis_context["who"]
+    face_conf = vis_context["conf"]
+
+    # In conversation mode, prioritize voice emotion
+    if voice_emotion and voice_emotion != "neutral":
+        final_emotion = voice_emotion
+        fusion_source = "Voice-Priority"
+    elif face_conf > 0.6:
+        final_emotion = face_emotion
+        fusion_source = "Face-Fallback"
+    else:
+        final_emotion = "neutral"
+        fusion_source = "Neutral-Fallback"
+
+    print(f"👤 User ({identity}): {text}", flush=True)
+    print(
+        f"📊 Fusion: [Face: {face_emotion}({face_conf:.2f}) | Voice: {voice_emotion}] "
+        f"-> Final: [{final_emotion}] ({fusion_source})",
+        flush=True
+    )
+
+    print("☁️ EmoQ Thinking...", flush=True)
+    stream = ask_deepseek(text, final_emotion, identity, system_prompt)
+
+    if stream:
+        print("🤖 EmoQ: ", end="", flush=True)
+        full_response = ""
+        for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                content = chunk.choices[0].delta.content
+                print(content, end="", flush=True)
+                full_response += content
+        print("", flush=True)
+        speak(full_response)
+    else:
+        print("🤖 (Network Error)", flush=True)
+
+    gc.collect()
+    return "MONITORING"
+
+
+# =========================================================
+# Main
+# =========================================================
+
+def main():
+    print("🚀 Starting EmoQ (State Machine Version)...", flush=True)
+    print(f"👂 Loading Local Hearing (Faster-Whisper {WHISPER_SIZE})...", flush=True)
+
+    print("⚙️ Current mode settings:", flush=True)
+    print(f"   TEST_MODE = {TEST_MODE}", flush=True)
+    print(f"   LOW_MOOD_WINDOW_SEC = {LOW_MOOD_WINDOW_SEC}", flush=True)
+    print(f"   LOW_MOOD_RATIO = {LOW_MOOD_RATIO}", flush=True)
+    print(f"   PROMPT_COOLDOWN_SEC = {PROMPT_COOLDOWN_SEC}", flush=True)
+    print(f"   PROMPT_WAIT_TIMEOUT_SEC = {PROMPT_WAIT_TIMEOUT_SEC}", flush=True)
+    print(f"   MONITOR_POLL_SEC = {MONITOR_POLL_SEC}", flush=True)
+
+    audio_model = WhisperModel(WHISPER_SIZE, device="cpu", compute_type="int8")
+
+    emo_engine = None
+    if EmotionEngine:
+        emo_engine = EmotionEngine()
+
+    GPIO.setmode(GPIO.BOARD)
+    GPIO.setup(BUTTON_PIN, GPIO.IN)
+
+    system_prompt = (
+        "You are EmoQ, an empathetic companion robot. "
+        "You will receive the user's name and their current emotional state. "
+        "If the user is not 'Unknown User', address them by their name occasionally. "
+        "Respond warmly, empathetically, and concisely in English (1-2 sentences). "
+        "Adjust your tone based on their emotion."
+    )
+
+    print("=" * 55, flush=True)
+    print("🤖 EmoQ Online (Monitoring / Prompt / Conversation)", flush=True)
+    print("=" * 55, flush=True)
+
+    emotion_history = deque()
+    last_prompt_time = 0
+    state = "MONITORING"
+
+    try:
+        while True:
+            try:
+                if state == "MONITORING":
+                    state = monitoring_state(emotion_history, last_prompt_time)
+
+                elif state == "PROMPT":
+                    last_prompt_time = time.time()
+                    state = prompt_state()
+
+                elif state == "CONVERSATION":
+                    state = conversation_state(audio_model, emo_engine, system_prompt)
+
+                else:
+                    print(f"⚠️ Unknown state: {state}. Resetting to MONITORING.", flush=True)
+                    state = "MONITORING"
+
+            except Exception as e:
+                print(f"⚠️ Main loop error: {e}", flush=True)
+                state = "MONITORING"
+                time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\n👋 Exiting...", flush=True)
+
+    finally:
+        GPIO.cleanup()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,56 @@
+
+# Python virtual environments
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# System files
+.DS_Store
+
+# Temporary files
+*.tmp
+*.log
+
+# Python virtual environments
+venv/
+.venv/
+env/
+*/venv/
+*/.venv/
+*/env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# System / temporary files
+.DS_Store
+*.tmp
+*.log
+
+# Python virtual environments
+venv/
+.venv/
+env/
+*/venv/
+*/.venv/
+*/env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# System / temporary files
+.DS_Store
+*.tmp
+*.log
