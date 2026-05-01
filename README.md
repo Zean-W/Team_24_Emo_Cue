@@ -1,6 +1,6 @@
 <h1>
   EmoQ: A Multimodal Emotional Companion Robot
-  <img src="images/Team_logo.png" alt="Team Logo" width="80" align="right">
+  <img src="Images/Team_logo.png" alt="Team Logo" width="80" align="right">
 </h1>
 
 **Senior Design Project | Boston University**
