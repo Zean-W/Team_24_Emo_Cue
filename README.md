@@ -23,6 +23,14 @@ The goal of EmoQ is not to replace human companionship, but to create a supporti
 
 ---
 
+## Demo Video
+
+The following video demonstrates the EmoQ senior design prototype, including the robot’s interaction flow, multimodal emotion detection, AI-generated response, and physical system integration.
+
+[Watch the EmoQ Demo Video](https://youtu.be/YjXM8wazJZY)
+
+---
+
 ## Key Features
 
 ### 1. Face Recognition
