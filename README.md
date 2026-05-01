@@ -1,10 +1,17 @@
-# EmoQ: A Multimodal Emotional Companion Robot
+<h1>
+  EmoQ: A Multimodal Emotional Companion Robot
+  <img src="images/Team_logo.png" alt="Team Logo" width="80" align="right">
+</h1>
 
 **Senior Design Project | Boston University**
 
 EmoQ is a desktop emotional companion robot designed to provide personalized and empathetic interactions for older adults. The system combines facial recognition, facial emotion detection, speech emotion analysis, and AI-generated responses to create a more natural and emotionally aware human-robot interaction experience.
 
 This repository contains project documentation, system overview, demo videos, testing results, and implementation materials for the EmoQ senior design project.
+
+<p align="center">
+  <img src="images/Team_photo.jpg" alt="Team Photo" width="700">
+</p>
 
 ---
 
