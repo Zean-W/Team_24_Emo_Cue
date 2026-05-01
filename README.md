@@ -10,7 +10,7 @@ EmoQ is a desktop emotional companion robot designed to provide personalized and
 This repository contains project documentation, system overview, demo videos, testing results, and implementation materials for the EmoQ senior design project.
 
 <p align="center">
-  <img src="images/Team_photo.jpg" alt="Team Photo" width="700">
+  <img src="Images/Team_photo.jpg" alt="Team Photo" width="700">
 </p>
 
 ---
